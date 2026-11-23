@@ -1,0 +1,93 @@
+diff -ru a/crates/rune-gpu/src/metal/device.rs b/crates/rune-gpu/src/metal/device.rs
+--- a/crates/rune-gpu/src/metal/device.rs	2026-11-23 23:40:37
++++ b/crates/rune-gpu/src/metal/device.rs	2026-11-23 23:40:37
+@@ -130,6 +130,7 @@
+     fn create_texture(&self, desc: &wgpu::TextureDescriptor<'_>) -> DispatchTexture {
+         let texture = MetalTexture::new(&self.shared.device, desc, Live::new(&self.shared.textures));
+         let raw = texture.raw.clone();
++        if super::encode::no_blit() { super::encode::cpu_zero_texture(&raw); return DispatchTexture::custom(texture) }
+         let zeros = self.shared.zeros.get_or_init(|| Zeros::new(&self.shared));
+         self.shared.upload(|blit| zero_texture(blit, zeros, &raw), [raw.clone() as _]);
+         DispatchTexture::custom(texture)
+diff -ru a/crates/rune-gpu/src/metal/encode.rs b/crates/rune-gpu/src/metal/encode.rs
+--- a/crates/rune-gpu/src/metal/encode.rs	2026-11-23 23:40:37
++++ b/crates/rune-gpu/src/metal/encode.rs	2026-11-23 23:40:37
+@@ -300,12 +300,13 @@
+         let mut rec = self.rec.lock();
+         rec.cb();
+         let (src, dst) = (source.buffer.as_custom::<MetalBuffer>().expect("a Metal buffer").raw(), texture(&destination));
++        if no_blit() { cpu_to_texture(src.raw.contents().as_ptr() as *const u8, source.layout, &dst, destination.mip_level, destination.origin, size); return }
+         buffer_to_texture(rec.blit(), &src.raw, source.layout, &dst, destination.mip_level, destination.origin, size);
+         rec.drawable |= dst.drawable;
+         rec.keep([src as _, dst as _]);
+     }
+     fn copy_texture_to_buffer(&self, source: wgpu::TexelCopyTextureInfo<'_>, destination: wgpu::TexelCopyBufferInfo<'_>, size: wgpu::Extent3d) {
+-        if size.width == 0 || size.height == 0 || size.depth_or_array_layers == 0 { return }
++        if size.width == 0 || size.height == 0 || size.depth_or_array_layers == 0 || no_blit() { return }
+         let (src, dst) = (texture(&source), destination.buffer.as_custom::<MetalBuffer>().expect("a Metal buffer").store.gpu_write());
+         let mut rec = self.rec.lock();
+         texture_to_buffer(rec.blit(), &src, source.mip_level, source.origin, &dst.raw, destination.layout, size);
+@@ -376,4 +377,40 @@
+ 
+ impl PipelineCacheInterface for Inert {
+     fn get_data(&self) -> Option<Vec<u8>> { None }
++}
++
++pub(crate) fn no_blit() -> bool {
++    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *F.get_or_init(|| std::env::var_os("RUNE_NOBLIT").is_some())
++}
++
++pub(super) fn cpu_zero_texture(texture: &TextureRaw) {
++    let Some(block) = texture.format.block_copy_size(None) else { return };
++    let (bw, bh) = texture.format.block_dimensions();
++    let three = texture.dimension == wgpu::TextureDimension::D3;
++    let raw = &texture.raw;
++    for mip in 0..texture.mips as usize {
++        let (w, h) = ((raw.width() >> mip).max(1), (raw.height() >> mip).max(1));
++        let row = w.div_ceil(bw as usize) * block as usize;
++        let rows = h.div_ceil(bh as usize);
++        let zeros = vec![0u8; row * rows];
++        let slices = if three { (raw.depth() >> mip).max(1) } else { texture.layers as usize };
++        for s in 0..slices {
++            let (slice, z) = if three { (0, s) } else { (s, 0) };
++            let region = objc2_metal::MTLRegion { origin: MTLOrigin { x: 0, y: 0, z }, size: MTLSize { width: w, height: h, depth: 1 } };
++            unsafe { raw.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(region, mip, slice, std::ptr::NonNull::new_unchecked(zeros.as_ptr() as *mut _), row, 0) }
++        }
++    }
++}
++
++pub(super) fn cpu_to_texture(base: *const u8, layout: wgpu::TexelCopyBufferLayout, texture: &TextureRaw, mip: u32, at: wgpu::Origin3d, size: wgpu::Extent3d) {
++    let (row, image) = strides(texture.format, layout, size);
++    for (slice, z, depth, i) in layers(texture, at, size) {
++        let per_image = if depth > 1 { image } else { 0 };
++        let region = objc2_metal::MTLRegion { origin: origin(at, z), size: extent(size.width, size.height, depth) };
++        unsafe {
++            let p = base.add(layout.offset as usize + image * i) as *mut std::ffi::c_void;
++            texture.raw.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(region, mip as usize, slice, std::ptr::NonNull::new_unchecked(p), row, per_image)
++        }
++    }
+ }
+diff -ru a/crates/rune-gpu/src/metal/resource.rs b/crates/rune-gpu/src/metal/resource.rs
+--- a/crates/rune-gpu/src/metal/resource.rs	2026-11-23 23:40:37
++++ b/crates/rune-gpu/src/metal/resource.rs	2026-11-23 23:40:37
+@@ -305,7 +305,7 @@
+     if desc.usage.contains(U::RENDER_ATTACHMENT) { usage |= MTLTextureUsage::RenderTarget; }
+     if desc.view_formats.iter().any(|f| *f != desc.format) { usage |= MTLTextureUsage::PixelFormatView; }
+     d.setUsage(usage);
+-    d.setStorageMode(MTLStorageMode::Private);
++    d.setStorageMode(if super::encode::no_blit() { MTLStorageMode::Shared } else { MTLStorageMode::Private });
+     let raw = device.newTextureWithDescriptor(&d).expect("a Metal texture");
+     #[cfg(debug_assertions)]
+     if let Some(label) = desc.label { raw.setLabel(Some(&NSString::from_str(label))); }
+diff -ru a/crates/rune-gpu/src/metal/submit.rs b/crates/rune-gpu/src/metal/submit.rs
+--- a/crates/rune-gpu/src/metal/submit.rs	2026-11-23 23:40:37
++++ b/crates/rune-gpu/src/metal/submit.rs	2026-11-23 23:40:37
+@@ -358,6 +358,7 @@
+         let data = &data[layout.offset as usize..];
+         if data.is_empty() || size.width == 0 || size.height == 0 || size.depth_or_array_layers == 0 { return }
+         let texture = dst.texture.as_custom::<MetalTexture>().expect("a Metal texture").raw.clone();
++        if super::encode::no_blit() { super::encode::cpu_to_texture(data.as_ptr(), wgpu::TexelCopyBufferLayout { offset: 0, ..layout }, &texture, dst.mip_level, dst.origin, size); return }
+         let staging = Arc::new(BufferRaw::with_bytes(&self.0, data, Some("rune metal write_texture")));
+         let layout = wgpu::TexelCopyBufferLayout { offset: 0, ..layout };
+         self.0.upload(|blit| buffer_to_texture(blit, &staging.raw, layout, &texture, dst.mip_level, dst.origin, size), [staging.clone() as _, texture.clone() as _]);

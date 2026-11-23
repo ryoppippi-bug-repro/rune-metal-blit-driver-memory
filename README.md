@@ -1,6 +1,6 @@
 # Rune's Metal blits cost a fixed ~135 MB of driver memory
 
-Upstream issue: ISSUE_URL. Rune `86b903de7fef9c6b683e05dc23440de4ebbc4347`, macOS 27.2.1 on an Apple M5 Max, Xcode 27.1 (Swift 6.4), Rust 1.99.
+Upstream issue: https://github.com/anomalyco/rune/issues/1753. Rune `86b903de7fef9c6b683e05dc23440de4ebbc4347`, macOS 27.2.1 on an Apple M5 Max, Xcode 27.1 (Swift 6.4), Rust 1.99.
 
 ## Steps
 
